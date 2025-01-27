@@ -9,11 +9,14 @@ from typing import Optional, List
 import aiofiles
 import io
 from aiolimiter import AsyncLimiter
+import logging
+
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
 class BackupBot(discord.Client):
+    """A specialized Discord client for creating and restoring server backups."""
     def __init__(self):
-        intents = discord.Intents.default()
-        intents.members = True  # Enable member intents
+        intents = discord.Intents.all()  # Enable all intents
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
 
@@ -23,6 +26,7 @@ class BackupBot(discord.Client):
 client = BackupBot()
 
 def get_backup_files():
+    """Return a list of backup JSON files found in the current directory."""
     files = []
     for f in os.listdir('.'):
         if f.startswith('backup_') and f.endswith('.json'):
@@ -40,7 +44,8 @@ async def send_progress(interaction, message):
         pass
 
 async def backup_role(role):
-    print(f"Backing up role: {role.name}")
+    """Backup an individual role's attributes."""
+    logging.info(f"Backing up role: {role.name}")
     return {
         'name': role.name,
         'permissions': role.permissions.value,
@@ -78,7 +83,7 @@ def serialize_overwrites(overwrites):
     return serialized
 
 async def backup_channel(channel, max_messages: Optional[int] = None):
-    print(f"Backing up channel: #{channel.name}")
+    logging.info(f"Backing up channel: #{channel.name}")
     try:
         messages = []
         if isinstance(channel, discord.TextChannel):
@@ -105,7 +110,7 @@ async def backup_channel(channel, max_messages: Optional[int] = None):
                         'timestamp': message.created_at.isoformat()
                     })
             except Exception as e:
-                print(f"Error backing up #{channel.name}: {str(e)}")
+                logging.error(f"Error backing up #{channel.name}: {str(e)}")
         
         # Get permission overwrites
         overwrites = serialize_overwrites(channel.overwrites)
@@ -125,10 +130,10 @@ async def backup_channel(channel, max_messages: Optional[int] = None):
             'messages': messages[::-1] if messages else []
         }
         
-        print(f"Successfully backed up {len(messages)} messages from #{channel.name}")
+        logging.info(f"Successfully backed up {len(messages)} messages from #{channel.name}")
         return channel_data
     except Exception as e:
-        print(f"Error backing up channel {channel.name}: {e}")
+        logging.error(f"Error backing up channel {channel.name}: {e}")
         # Return basic channel data on error
         return {
             'name': channel.name,
@@ -143,37 +148,39 @@ async def backup_member_roles(member):
         'roles': [role.id for role in member.roles if not role.is_default()]
     }
 
-async def backup_automod_rules(guild):
-    rules = []
-    try:
-        async for rule in guild.auto_moderation_rules():  # Changed from automod_rules()
-            rules.append({
-                'name': rule.name,
-                'creator_id': rule.creator_id,
-                'event_type': rule.event_type.value,
-                'trigger_type': rule.trigger_type.value,  # Changed from trigger.type
-                'trigger_metadata': rule.trigger_metadata.to_dict(),  # Changed from trigger.to_dict()
-                'actions': [action.to_dict() for action in rule.actions],
-                'enabled': rule.enabled,
-                'exempt_roles': [role.id for role in rule.exempt_roles],
-                'exempt_channels': [channel.id for channel in rule.exempt_channels]
-            })
-    except Exception as e:
-        print(f"Error backing up automod rules: {e}")
-    return rules
+async def download_asset(url):
+    """Download asset from URL and return bytes"""
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as response:
+            if response.status == 200:
+                return await response.read()
+            return None
 
 async def backup_emoji_or_sticker(asset):
-    # Download the asset
-    asset_bytes = await asset.read()
-    return {
-        'name': asset.name,
-        'url': str(asset.url),
-        'image': asset_bytes.hex(),  # Store as hex string
-        'type': 'emoji' if isinstance(asset, discord.Emoji) else 'sticker'
-    }
+    """Backup an emoji or sticker with proper image downloading"""
+    try:
+        logging.info(f"Backing up {'emoji' if isinstance(asset, discord.Emoji) else 'sticker'}: {asset.name}")
+        # Get the image URL
+        asset_url = asset.url
+        
+        # Download the image
+        image_data = await download_asset(asset_url)
+        if not image_data:
+            logging.error(f"Failed to download {'emoji' if isinstance(asset, discord.Emoji) else 'sticker'}: {asset.name}")
+            return None
+            
+        return {
+            'name': asset.name,
+            'url': str(asset_url),
+            'image': image_data.hex(),  # Convert bytes to hex string
+            'type': 'emoji' if isinstance(asset, discord.Emoji) else 'sticker'
+        }
+    except Exception as e:
+        logging.error(f"Error backing up {'emoji' if isinstance(asset, discord.Emoji) else 'sticker'} {asset.name}: {e}")
+        return None
 
 async def backup_server(interaction, max_messages: Optional[int] = None):
-    print(f"\nStarting backup of server: {interaction.guild.name}")
+    logging.info(f"\nStarting backup of server: {interaction.guild.name}")
     guild = interaction.guild
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_data = {
@@ -184,34 +191,48 @@ async def backup_server(interaction, max_messages: Optional[int] = None):
         'members': [],
         'bans': [],
         'emojis': [],
-        'stickers': [],
-        'automod_rules': []
+        'stickers': []
     }
-    
+
+    # Add ban backup section right after initial setup
+    logging.info("Backing up bans...")
+    try:
+        async for ban_entry in guild.bans():
+            backup_data['bans'].append({
+                'user_id': ban_entry.user.id,
+                'user_name': str(ban_entry.user),
+                'reason': ban_entry.reason
+            })
+        logging.info(f"✓ Backed up {len(backup_data['bans'])} bans")
+    except Exception as e:
+        logging.error(f"Error backing up bans: {e}")
+
+    # Removed automod backup section
+
     # Backup roles
-    print("\nBacking up roles...")
+    logging.info("Backing up roles...")
     for role in guild.roles:
         backup_data['roles'][role.id] = await backup_role(role)
-    print(f"✓ Backed up {len(backup_data['roles'])} roles")
+    logging.info(f"✓ Backed up {len(backup_data['roles'])} roles")
 
     # Backup member roles
-    print("\nBacking up member roles...")
+    logging.info("Backing up member roles...")
     member_tasks = []
     for member in guild.members:
         if not member.bot:  # Skip bots
             member_tasks.append(backup_member_roles(member))
     
     backup_data['members'] = await asyncio.gather(*member_tasks)
-    print(f"✓ Backed up roles for {len(backup_data['members'])} members")
+    logging.info(f"✓ Backed up roles for {len(backup_data['members'])} members")
     
     # Backup categories
-    print("\nBacking up categories...")
+    logging.info("Backing up categories...")
     for category in guild.categories:
         backup_data['categories'][category.id] = {
             'name': category.name,
             'position': category.position
         }
-    print(f"✓ Backed up {len(backup_data['categories'])} categories")
+    logging.info(f"✓ Backed up {len(backup_data['categories'])} categories")
     
     # Backup channels
     channel_tasks = [backup_channel(channel, max_messages) 
@@ -227,17 +248,49 @@ async def backup_server(interaction, max_messages: Optional[int] = None):
         total_messages += count
         channel_stats[data['name']] = count
     
+    # Backup emojis
+    logging.info("Backing up emojis...")
+    emoji_tasks = []
+    for emoji in guild.emojis:
+        if not emoji.managed:  # Skip managed emojis (like Nitro emojis)
+            emoji_tasks.append(backup_emoji_or_sticker(emoji))
+    
+    if emoji_tasks:
+        emoji_results = await asyncio.gather(*emoji_tasks)
+        # Filter out None results from failed backups
+        backup_data['emojis'] = [e for e in emoji_results if e is not None]
+        logging.info(f"✓ Backed up {len(backup_data['emojis'])} emojis")
+    else:
+        logging.info("No emojis to backup")
+
+    # Backup stickers
+    logging.info("Backing up stickers...")
+    sticker_tasks = []
+    for sticker in guild.stickers:
+        if not sticker.available:  # Skip unavailable stickers
+            continue
+        sticker_tasks.append(backup_emoji_or_sticker(sticker))
+    
+    if sticker_tasks:
+        sticker_results = await asyncio.gather(*sticker_tasks)
+        # Filter out None results from failed backups
+        backup_data['stickers'] = [s for s in sticker_results if s is not None]
+        logging.info(f"✓ Backed up {len(backup_data['stickers'])} stickers")
+    else:
+        logging.info("No stickers to backup")
+
     filename = f'backup_{interaction.guild.id}_{timestamp}.json'
     async with aiofiles.open(filename, 'w') as f:
         await f.write(json.dumps(backup_data))
     
-    print(f"\nBackup completed! Saved to {filename}")
+    logging.info(f"Backup completed! Saved to {filename}")
     
     # Return necessary data for the backup summary
     return backup_data, channel_stats, timestamp
 
 async def restore_channel(channel, data):
-    print(f"\nRestoring messages in #{channel.name}")
+    """Restore messages into a newly created channel using a webhook."""
+    logging.info(f"Restoring messages in #{channel.name}")
     webhook = await channel.create_webhook(name='RestoreBot')
     try:
         for msg in data['messages']:
@@ -273,29 +326,29 @@ async def restore_channel(channel, data):
                             else:
                                 raise  # Re-raise if it's not a rate limit error
             except Exception as e:
-                print(f"Error restoring message: {e}")
+                logging.error(f"Error restoring message: {e}")
                 await asyncio.sleep(5)  # Longer delay on error
                 continue
     finally:
         await webhook.delete()
-    print(f"✓ Restored {len(data['messages'])} messages in #{channel.name}")
+    logging.info(f"Restored {len(data['messages'])} messages in #{channel.name}")
 
 async def restore_channels(interaction, backup, roles):
-    print("\nRestoring server structure...")
+    logging.info("Restoring server structure...")
     
     # Create/update roles first
-    print("\nRestoring roles...")
+    logging.info("Restoring roles...")
     default_role = interaction.guild.default_role
     
     for role_id, role_data in backup.get('roles', {}).items():
         try:
             if role_data.get('is_default'):
-                print(f"Updating @everyone permissions")
+                logging.info(f"Updating @everyone permissions")
                 await default_role.edit(permissions=discord.Permissions(role_data['permissions']))
                 roles[int(role_id)] = default_role
             else:
                 new_name = f"{role_data['name']}-restored"
-                print(f"Creating role: {new_name}")
+                logging.info(f"Creating role: {new_name}")
                 new_role = await interaction.guild.create_role(
                     name=new_name,
                     permissions=discord.Permissions(role_data['permissions']),
@@ -304,15 +357,15 @@ async def restore_channels(interaction, backup, roles):
                     mentionable=role_data['mentionable']
                 )
                 roles[int(role_id)] = new_role
-                print(f"✓ Created role: {new_name}")
+                logging.info(f"✓ Created role: {new_name}")
         except Exception as e:
-            print(f"❌ Error creating role {role_data['name']}: {e}")
+            logging.error(f"❌ Error creating role {role_data['name']}: {e}")
     
     # Wait for roles to be available
     await asyncio.sleep(2)
     
     # Create categories first
-    print("\nRestoring categories...")
+    logging.info("Restoring categories...")
     categories = {}
     for cat_id, cat_data in backup.get('categories', {}).items():
         try:
@@ -322,11 +375,11 @@ async def restore_channels(interaction, backup, roles):
             )
             categories[int(cat_id)] = category
         except Exception as e:
-            print(f"Error creating category {cat_data['name']}: {e}")
-    print(f"✓ Restored {len(categories)} categories")
+            logging.error(f"Error creating category {cat_data['name']}: {e}")
+    logging.info(f"✓ Restored {len(categories)} categories")
 
     # Create all channels
-    print("\nRestoring channels...")
+    logging.info("Restoring channels...")
     channels = []
     for channel_name, channel_data in backup['channels'].items():
         try:
@@ -372,27 +425,27 @@ async def restore_channels(interaction, backup, roles):
         except Exception as e:
             await send_progress(interaction, f"Error creating channel {channel_name}: {str(e)}")
             continue
-    print(f"✓ Restored {len(channels)} channels")
+    logging.info(f"✓ Restored {len(channels)} channels")
 
     return channels
 
 async def restore_server(interaction, backup):
-    print(f"\nStarting restore for server: {interaction.guild.name}")
+    logging.info(f"\nStarting restore for server: {interaction.guild.name}")
     
     # Create/update roles first
-    print("\nRestoring roles...")
+    logging.info("Restoring roles...")
     roles = {}
     default_role = interaction.guild.default_role
     
     for role_id, role_data in backup.get('roles', {}).items():
         try:
             if role_data.get('is_default'):
-                print(f"Updating @everyone permissions")
+                logging.info(f"Updating @everyone permissions")
                 await default_role.edit(permissions=discord.Permissions(role_data['permissions']))
                 roles[int(role_id)] = default_role
             else:
                 new_name = f"{role_data['name']}-restored"
-                print(f"Creating role: {new_name}")
+                logging.info(f"Creating role: {new_name}")
                 new_role = await interaction.guild.create_role(
                     name=new_name,
                     permissions=discord.Permissions(role_data['permissions']),
@@ -401,49 +454,57 @@ async def restore_server(interaction, backup):
                     mentionable=role_data['mentionable']
                 )
                 roles[int(role_id)] = new_role
-                print(f"✓ Created role: {new_name}")
+                logging.info(f"✓ Created role: {new_name}")
         except Exception as e:
-            print(f"❌ Error creating role {role_data['name']}: {e}")
+            logging.error(f"❌ Error creating role {role_data['name']}: {e}")
     
     # Wait for roles to be available
     await asyncio.sleep(2)
     
     # Restore member roles
-    print("\nRestoring member roles...")
+    logging.info("Restoring member roles...")
     for member_data in backup.get('members', []):
         try:
-            print(f"Restoring roles for member: {member_data['name']}")
+            logging.info(f"Restoring roles for member: {member_data['name']}")
             member = interaction.guild.get_member(member_data['id'])
             if member:
                 role_ids = member_data['roles']
                 restored_roles = [roles.get(role_id) for role_id in role_ids if roles.get(role_id)]
                 if restored_roles:
                     await member.add_roles(*restored_roles, reason="Backup restoration")
-                    print(f"✓ Restored {len(restored_roles)} roles for: {member_data['name']}")
+                    logging.info(f"✓ Restored {len(restored_roles)} roles for: {member_data['name']}")
         except Exception as e:
-            print(f"❌ Error restoring roles for {member_data['name']}: {e}")
+            logging.error(f"❌ Error restoring roles for {member_data['name']}: {e}")
     
-    # Continue with rest of restoration
-    print("\nRestoring automod rules...")
-    for rule_data in backup.get('automod_rules', []):
+    # Continue with rest of restoration - bans, emojis, stickers
+    for ban_data in backup.get('bans', []):
         try:
-            print(f"Creating automod rule: {rule_data['name']}")
-            await interaction.guild.create_auto_moderation_rule(
-                name=f"{rule_data['name']}-restored",
-                event_type=discord.AutoModEventType(rule_data['event_type']),
-                trigger_type=discord.AutoModTriggerType(rule_data['trigger_type']),
-                trigger_metadata=discord.AutoModTriggerMetadata.from_dict(rule_data['trigger_metadata']),
-                actions=[discord.AutoModAction.from_dict(action) for action in rule_data['actions']],
-                enabled=rule_data['enabled'],
-                exempt_roles=[roles.get(role_id) for role_id in rule_data['exempt_roles'] if roles.get(role_id)],
-                exempt_channels=[channel for channel in interaction.guild.channels if channel.id in rule_data['exempt_channels']]
-            )
-            print(f"✓ Created automod rule: {rule_data['name']}")
+            user = await client.fetch_user(ban_data['user_id'])
+            await interaction.guild.ban(user, reason=f"Restored ban: {ban_data['reason']}")
         except Exception as e:
-            print(f"❌ Error creating automod rule {rule_data['name']}: {e}")
+            logging.error(f"Error restoring ban for user {ban_data['user_id']}: {e}")
     
-    # Continue with the rest of the restoration (bans, emojis, channels etc)
-    # ...existing code...
+    # Restore emojis and stickers
+    for emoji_data in backup.get('emojis', []):
+        try:
+            image = bytes.fromhex(emoji_data['image'])
+            await interaction.guild.create_custom_emoji(
+                name=f"{emoji_data['name']}-restored",
+                image=image
+            )
+        except Exception as e:
+            logging.error(f"Error restoring emoji {emoji_data['name']}: {e}")
+    
+    for sticker_data in backup.get('stickers', []):
+        try:
+            image = bytes.fromhex(sticker_data['image'])
+            await interaction.guild.create_sticker(
+                name=f"{sticker_data['name']}-restored",
+                file=discord.File(io.BytesIO(image), filename='sticker.png'),
+                emoji='👍'  # Default emoji
+            )
+        except Exception as e:
+            logging.error(f"Error restoring sticker {sticker_data['name']}: {e}")
 
     # Note: roles dict is now passed to restore_channels
     return await restore_channels(interaction, backup, roles)
@@ -459,6 +520,13 @@ async def backup(interaction: discord.Interaction, max_messages: Optional[int] =
     
     backup_data, channel_stats, timestamp = await backup_server(interaction, max_messages)
     
+    await send_progress(interaction, "Backing up bans...")
+    await send_progress(interaction, "Backing up roles...")
+    await send_progress(interaction, "Backing up member roles...")
+    await send_progress(interaction, "Backing up categories...")
+    await send_progress(interaction, "Backing up channels... This may take a while.")
+    await send_progress(interaction, "Backing up emojis and stickers...")
+
     # Construct a single, compact backup summary message
     # Sort channels by message count and get top 5
     top_channels = sorted(channel_stats.items(), key=lambda x: x[1], reverse=True)[:5]
@@ -471,8 +539,8 @@ async def backup(interaction: discord.Interaction, max_messages: Optional[int] =
         f"• Messages: {sum(channel_stats.values())}\n"
         f"• Emojis: {len(backup_data['emojis'])}\n"
         f"• Stickers: {len(backup_data['stickers'])}\n"
-        f"• AutoMod Rules: {len(backup_data['automod_rules'])}\n"
         f"• Bans: {len(backup_data['bans'])}\n"
+        # Removed AutoMod Rules line
         f"• Backup ID: {timestamp}\n\n"
         f"**Top 5 Channels:**\n" + " ".join(
             [f"• #{channel}: {count} msgs\n" for channel, count in top_channels]
@@ -482,14 +550,26 @@ async def backup(interaction: discord.Interaction, max_messages: Optional[int] =
     await interaction.followup.send(stats_message, ephemeral=True)
 
 @client.tree.command(name="restore", description="Restore a backup (creates new channels)")
-@app_commands.describe(backup_id="The backup ID to restore (required, format: YYYYMMDD_HHMMSS)")
+@app_commands.describe(
+    backup_id="The backup ID to restore (format: YYYYMMDD_HHMMSS)",
+    force="Bypass server ID check to restore from another server backup"
+)
 @app_commands.checks.has_permissions(administrator=True)
-async def restore(interaction: discord.Interaction, backup_id: str):
+async def restore(interaction: discord.Interaction, backup_id: str, force: bool = False):
     await interaction.response.defer(ephemeral=True)
     
     # Get backup file
     backup_files = get_backup_files()
     filename = next((f for f in backup_files if backup_id in f), None)
+    
+    # Check if backup belongs to this server
+    backup_server_id = filename.split('_')[1] if filename else None
+    if backup_server_id and not force and backup_server_id != str(interaction.guild.id):
+        await interaction.followup.send(
+            "Backup belongs to a different server. Use force=True to override.",
+            ephemeral=True
+        )
+        return
     
     if not filename:
         await interaction.followup.send(
@@ -502,9 +582,12 @@ async def restore(interaction: discord.Interaction, backup_id: str):
         with open(filename, 'r') as f:
             backup = json.load(f)
         
+        await send_progress(interaction, "Restoring roles...")
+        roles = {}
         # Create categories and channels
         channels = await restore_server(interaction, backup)
         
+        await send_progress(interaction, "Restoring member roles...")
         # Restore messages sequentially to avoid rate limits
         total_restored = 0
         for channel, data in channels:
@@ -538,14 +621,14 @@ async def undo(interaction: discord.Interaction):
         try:
             await channel.delete()
         except Exception as e:
-            print(f"Error deleting channel {channel.name}: {e}")
+            logging.error(f"Error deleting channel {channel.name}: {e}")
     
     # Delete roles next
     for role in restored_roles:
         try:
             await role.delete()
         except Exception as e:
-            print(f"Error deleting role {role.name}: {e}")
+            logging.error(f"Error deleting role {role.name}: {e}")
     
     await interaction.followup.send(
         f"Cleanup completed!\n"
@@ -603,7 +686,7 @@ async def list_backups(interaction: discord.Interaction):
                 continue
                 
         except Exception as e:
-            print(f"Error processing backup file {file}: {e}")
+            logging.error(f"Error processing backup file {file}: {e}")
             continue
     
     # Build output message
@@ -715,7 +798,7 @@ async def remove_restored_prefix(interaction: discord.Interaction):
             new_name = channel.name.replace('-restored', '')
             await channel.edit(name=new_name)
         except Exception as e:
-            print(f"Error renaming channel {channel.name}: {e}")
+            logging.error(f"Error renaming channel {channel.name}: {e}")
     
     # Rename roles
     for role in restored_roles:
@@ -723,7 +806,7 @@ async def remove_restored_prefix(interaction: discord.Interaction):
             new_name = role.name.replace('-restored', '')
             await role.edit(name=new_name)
         except Exception as e:
-            print(f"Error renaming role {role.name}: {e}")
+            logging.error(f"Error renaming role {role.name}: {e}")
     
     await interaction.followup.send(
         f"Renaming completed!\n"
@@ -752,7 +835,7 @@ async def on_error(interaction: discord.Interaction, error: app_commands.AppComm
                     ephemeral=True
                 )
     except Exception as e:
-        print(f"Error in error handler: {e}")
+        logging.error(f"Error in error handler: {e}")
 
 # Create a rate limiter for Discord API 
 rate_limiter = AsyncLimiter(1, 1)
