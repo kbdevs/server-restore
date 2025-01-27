@@ -717,8 +717,8 @@ async def on_error(interaction: discord.Interaction, error: app_commands.AppComm
     except Exception as e:
         print(f"Error in error handler: {e}")
 
-# Create a rate limiter for Discord API (5 requests per second)
-rate_limiter = AsyncLimiter(5, 1)
+# Create a rate limiter for Discord API 
+rate_limiter = AsyncLimiter(1, 3)
 
 async def send_with_rate_limit(webhook, content, username, avatar_url, embeds):
     async with rate_limiter:
