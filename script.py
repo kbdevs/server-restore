@@ -336,33 +336,31 @@ async def restore_channel(channel, data):
 async def restore_channels(interaction, backup, roles):
     logging.info("Restoring server structure...")
     
-    # Create/update roles first
-    logging.info("Restoring roles...")
-    default_role = interaction.guild.default_role
+    # Removed duplicate role restoration:
+    # logging.info("Restoring roles...")
+    # default_role = interaction.guild.default_role
+    # for role_id, role_data in backup.get('roles', {}).items():
+    #     try:
+    #         if role_data.get('is_default'):
+    #             logging.info(f"Updating @everyone permissions")
+    #             await default_role.edit(permissions=discord.Permissions(role_data['permissions']))
+    #             roles[int(role_id)] = default_role
+    #         else:
+    #             new_name = f"{role_data['name']}-restored"
+    #             logging.info(f"Creating role: {new_name}")
+    #             new_role = await interaction.guild.create_role(
+    #                 name=new_name,
+    #                 permissions=discord.Permissions(role_data['permissions']),
+    #                 color=discord.Color(role_data['color']),
+    #                 hoist=role_data['hoist'],
+    #                 mentionable=role_data['mentionable']
+    #             )
+    #             roles[int(role_id)] = new_role
+    #             logging.info(f"✓ Created role: {new_name}")
+    #     except Exception as e:
+    #         logging.error(f"Error creating role {role_data['name']}: {e}")
     
-    for role_id, role_data in backup.get('roles', {}).items():
-        try:
-            if role_data.get('is_default'):
-                logging.info(f"Updating @everyone permissions")
-                await default_role.edit(permissions=discord.Permissions(role_data['permissions']))
-                roles[int(role_id)] = default_role
-            else:
-                new_name = f"{role_data['name']}-restored"
-                logging.info(f"Creating role: {new_name}")
-                new_role = await interaction.guild.create_role(
-                    name=new_name,
-                    permissions=discord.Permissions(role_data['permissions']),
-                    color=discord.Color(role_data['color']),
-                    hoist=role_data['hoist'],
-                    mentionable=role_data['mentionable']
-                )
-                roles[int(role_id)] = new_role
-                logging.info(f"✓ Created role: {new_name}")
-        except Exception as e:
-            logging.error(f"❌ Error creating role {role_data['name']}: {e}")
-    
-    # Wait for roles to be available
-    await asyncio.sleep(2)
+    # Removed await asyncio.sleep(2) since waiting for roles is no longer required
     
     # Create categories first
     logging.info("Restoring categories...")
@@ -377,7 +375,7 @@ async def restore_channels(interaction, backup, roles):
         except Exception as e:
             logging.error(f"Error creating category {cat_data['name']}: {e}")
     logging.info(f"✓ Restored {len(categories)} categories")
-
+    
     # Create all channels
     logging.info("Restoring channels...")
     channels = []
@@ -426,7 +424,7 @@ async def restore_channels(interaction, backup, roles):
             await send_progress(interaction, f"Error creating channel {channel_name}: {str(e)}")
             continue
     logging.info(f"✓ Restored {len(channels)} channels")
-
+    
     return channels
 
 async def restore_server(interaction, backup):
@@ -509,28 +507,57 @@ async def restore_server(interaction, backup):
     # Note: roles dict is now passed to restore_channels
     return await restore_channels(interaction, backup, roles)
 
+# NEW: Progress bar helper
+def get_progress_bar(current: int, total: int, bar_length: int = 20) -> str:
+    percent = current / total
+    filled = int(percent * bar_length)
+    bar = '#' * filled + '-' * (bar_length - filled)
+    return f"[{bar}] {current}/{total}"
+
+# NEW: Update ephemeral message and log progress
+async def update_progress(interaction: discord.Interaction, msg_obj, current: int, total: int, task: str):
+    progress_text = f"Progress: {get_progress_bar(current, total)} - {task}"
+    await interaction.followup.edit_message(msg_obj.id, content=progress_text)
+    logging.info(progress_text)
+
 @client.tree.command(name="backup", description="Create a backup of the entire server")
 @app_commands.describe(
     max_messages="Maximum number of messages to backup per channel (default: all messages)"
 )
 @app_commands.checks.has_permissions(administrator=True)
 async def backup(interaction: discord.Interaction, max_messages: Optional[int] = None):
-    await interaction.response.defer(ephemeral=True)
-    await send_progress(interaction, "Starting comprehensive server backup...")
+    total_steps = 8  # Adjust as needed per major backup step
+    # Send an initial ephemeral progress message
+    await interaction.response.send_message(
+        f"Progress: {get_progress_bar(0, total_steps)} - Starting backup...", ephemeral=True
+    )
+    # FIX: Retrieve the actual message object for later edits
+    progress_msg = await interaction.original_response()
     
+    # Step 1: Starting backup
+    await update_progress(interaction, progress_msg, 1, total_steps, "Backing up bans...")
     backup_data, channel_stats, timestamp = await backup_server(interaction, max_messages)
     
-    await send_progress(interaction, "Backing up bans...")
-    await send_progress(interaction, "Backing up roles...")
-    await send_progress(interaction, "Backing up member roles...")
-    await send_progress(interaction, "Backing up categories...")
-    await send_progress(interaction, "Backing up channels... This may take a while.")
-    await send_progress(interaction, "Backing up emojis and stickers...")
-
-    # Construct a single, compact backup summary message
-    # Sort channels by message count and get top 5
-    top_channels = sorted(channel_stats.items(), key=lambda x: x[1], reverse=True)[:5]
+    # Step 2: Bans already backed up (logged inside backup_server)
+    await update_progress(interaction, progress_msg, 2, total_steps, "Backing up roles...")
     
+    # Step 3: Roles
+    await update_progress(interaction, progress_msg, 3, total_steps, "Backing up member roles...")
+    
+    # Step 4: Member roles
+    await update_progress(interaction, progress_msg, 4, total_steps, "Backing up categories...")
+    
+    # Step 5: Categories
+    await update_progress(interaction, progress_msg, 5, total_steps, "Backing up channels...")
+    
+    # Step 6: Channels (this may take a while)
+    await update_progress(interaction, progress_msg, 6, total_steps, "Backing up emojis and stickers...")
+    
+    # Step 7: Emojis and stickers
+    await update_progress(interaction, progress_msg, 7, total_steps, "Finalizing backup...")
+    
+    # Finish: Build and send backup summary as before
+    top_channels = sorted(channel_stats.items(), key=lambda x: x[1], reverse=True)[:5]
     stats_message = (
         f"**Backup Completed!**\n"
         f"• Roles: {len(backup_data['roles'])}\n"
@@ -540,13 +567,13 @@ async def backup(interaction: discord.Interaction, max_messages: Optional[int] =
         f"• Emojis: {len(backup_data['emojis'])}\n"
         f"• Stickers: {len(backup_data['stickers'])}\n"
         f"• Bans: {len(backup_data['bans'])}\n"
-        # Removed AutoMod Rules line
-        f"• Backup ID: {timestamp}\n\n"
+        f"• Backup ID: `{timestamp}`\n\n"
         f"**Top 5 Channels:**\n" + " ".join(
             [f"• #{channel}: {count} msgs\n" for channel, count in top_channels]
         )
     )
     
+    await update_progress(interaction, progress_msg, total_steps, total_steps, "Backup completed!")
     await interaction.followup.send(stats_message, ephemeral=True)
 
 @client.tree.command(name="restore", description="Restore a backup (creates new channels)")
@@ -556,13 +583,18 @@ async def backup(interaction: discord.Interaction, max_messages: Optional[int] =
 )
 @app_commands.checks.has_permissions(administrator=True)
 async def restore(interaction: discord.Interaction, backup_id: str, force: bool = False):
-    await interaction.response.defer(ephemeral=True)
+    total_steps = 4  # 1: Load backup, 2: Restore server structure, 3: Restore messages, 4: Finalize
+    # Send initial progress message
+    await interaction.response.send_message(
+        f"Progress: {get_progress_bar(0, total_steps)} - Starting restore...", ephemeral=True
+    )
+    progress_msg = await interaction.original_response()
     
-    # Get backup file
+    # Step 1: Load backup file
+    await update_progress(interaction, progress_msg, 1, total_steps, "Loading backup file...")
     backup_files = get_backup_files()
     filename = next((f for f in backup_files if backup_id in f), None)
     
-    # Check if backup belongs to this server
     backup_server_id = filename.split('_')[1] if filename else None
     if backup_server_id and not force and backup_server_id != str(interaction.guild.id):
         await interaction.followup.send(
@@ -570,65 +602,75 @@ async def restore(interaction: discord.Interaction, backup_id: str, force: bool 
             ephemeral=True
         )
         return
-    
     if not filename:
         await interaction.followup.send(
             "Backup ID not found! Use `/backups` to see available backups.",
             ephemeral=True
         )
         return
+    with open(filename, 'r') as f:
+        backup = json.load(f)
     
-    try:
-        with open(filename, 'r') as f:
-            backup = json.load(f)
-        
-        await send_progress(interaction, "Restoring roles...")
-        roles = {}
-        # Create categories and channels
-        channels = await restore_server(interaction, backup)
-        
-        await send_progress(interaction, "Restoring member roles...")
-        # Restore messages sequentially to avoid rate limits
-        total_restored = 0
-        for channel, data in channels:
-            if (data['type'] == 'text'):
-                await restore_channel(channel, data)
-                total_restored += 1
-                await send_progress(interaction, f"Restored messages in {total_restored}/{len(channels)} channels")
-            
-        await interaction.followup.send(
-            f"Restore completed!\n"
-            f"• Categories restored: {len(backup.get('categories', {}))}\n"
-            f"• Channels restored: {len(channels)}",
-            ephemeral=True
-        )
-    except Exception as e:
-        await interaction.followup.send(f"Error during restore: {str(e)}", ephemeral=True)
+    # Step 2: Restore server structure (roles, categories, channels, member roles)
+    await update_progress(interaction, progress_msg, 2, total_steps, "Restoring server structure...")
+    roles = {}  # roles will be handled inside restore_server
+    channels = await restore_server(interaction, backup)
+    
+    # Step 3: Restore channel messages sequentially
+    await update_progress(interaction, progress_msg, 3, total_steps, "Restoring channel messages...")
+    total_restored = 0
+    total_channels = len(channels)
+    for channel, data in channels:
+        if data['type'] == 'text':
+            await restore_channel(channel, data)
+        total_restored += 1
+        # Optionally update progress per channel (using current step progress info)
+        await update_progress(interaction, progress_msg, 3, total_steps,
+                              f"Restoring messages: {total_restored}/{total_channels} channels")
+    
+    # Step 4: Finalize restoration and send summary
+    await update_progress(interaction, progress_msg, total_steps, total_steps, "Finalizing restore...")
+    await interaction.followup.send(
+        f"Restore completed!\n"
+        f"• Categories restored: {len(backup.get('categories', {}))}\n"
+        f"• Channels restored: {len(channels)}",
+        ephemeral=True
+    )
 
 @client.tree.command(name="undo", description="Remove all restored channels and roles")
 @app_commands.checks.has_permissions(administrator=True)
 async def undo(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    
-    # Find restored channels
+    # Gather restored channels and roles
     restored_channels = [c for c in interaction.guild.channels if '-restored' in c.name]
-    
-    # Find restored roles
     restored_roles = [r for r in interaction.guild.roles if '-restored' in r.name]
+    total_ops = len(restored_channels) + len(restored_roles)
+    if total_ops == 0:
+        await interaction.response.send_message("No restored channels or roles found.", ephemeral=True)
+        return
+    # Send initial progress message
+    await interaction.response.send_message(
+        f"Progress: {get_progress_bar(0, total_ops)} - Starting cleanup...", ephemeral=True
+    )
+    progress_msg = await interaction.original_response()
+    ops_done = 0
     
-    # Delete channels first
+    # Delete channels
     for channel in restored_channels:
         try:
             await channel.delete()
         except Exception as e:
             logging.error(f"Error deleting channel {channel.name}: {e}")
+        ops_done += 1
+        await update_progress(interaction, progress_msg, ops_done, total_ops, f"Deleted channel: {channel.name}")
     
-    # Delete roles next
+    # Delete roles
     for role in restored_roles:
         try:
             await role.delete()
         except Exception as e:
             logging.error(f"Error deleting role {role.name}: {e}")
+        ops_done += 1
+        await update_progress(interaction, progress_msg, ops_done, total_ops, f"Deleted role: {role.name}")
     
     await interaction.followup.send(
         f"Cleanup completed!\n"
@@ -689,13 +731,18 @@ async def list_backups(interaction: discord.Interaction):
             logging.error(f"Error processing backup file {file}: {e}")
             continue
     
-    # Build output message
-    output = ["__Available backups:__\n"]
+    # Sort each guild's backups oldest first, newest last
+    for guild_id in servers:
+        servers[guild_id] = sorted(servers[guild_id], key=lambda x: x['unix_ts'])
     
-    for guild_id, backups in servers.items():
+    # Reorder the server groups so that the overall oldest backups come first
+    sorted_servers = sorted(servers.items(), key=lambda item: min(x['unix_ts'] for x in item[1]))
+    
+    # Build output message using the sorted groups
+    output = ["__Available backups:__\n"]
+    for guild_id, backups in sorted_servers:
         guild_name = get_guild_name(client, guild_id)
         output.append(f"\n**{guild_name}** (ID: {guild_id})")
-        
         for backup in backups:
             output.append(
                 f"┌ **ID: `{backup['id']}`**\n"
@@ -838,7 +885,7 @@ async def on_error(interaction: discord.Interaction, error: app_commands.AppComm
         logging.error(f"Error in error handler: {e}")
 
 # Create a rate limiter for Discord API 
-rate_limiter = AsyncLimiter(1, 1)
+rate_limiter = AsyncLimiter(1, 2)
 
 async def send_with_rate_limit(webhook, content, username, avatar_url, embeds):
     async with rate_limiter:
