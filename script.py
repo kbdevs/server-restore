@@ -10,6 +10,7 @@ import aiofiles
 import io
 from aiolimiter import AsyncLimiter
 import logging
+import re  # new import added
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
@@ -179,7 +180,8 @@ async def backup_emoji_or_sticker(asset):
         logging.error(f"Error backing up {'emoji' if isinstance(asset, discord.Emoji) else 'sticker'} {asset.name}: {e}")
         return None
 
-async def backup_server(interaction, max_messages: Optional[int] = None):
+# UPDATED: Modify backup_server to update progress in real time
+async def backup_server(interaction, max_messages: Optional[int] = None, total_steps: int = 8):
     logging.info(f"\nStarting backup of server: {interaction.guild.name}")
     guild = interaction.guild
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -193,8 +195,7 @@ async def backup_server(interaction, max_messages: Optional[int] = None):
         'emojis': [],
         'stickers': []
     }
-
-    # Add ban backup section right after initial setup
+    # Step 1: Backing up bans
     logging.info("Backing up bans...")
     try:
         async for ban_entry in guild.bans():
@@ -206,27 +207,24 @@ async def backup_server(interaction, max_messages: Optional[int] = None):
         logging.info(f"✓ Backed up {len(backup_data['bans'])} bans")
     except Exception as e:
         logging.error(f"Error backing up bans: {e}")
-
-    # Removed automod backup section
-
-    # Backup roles
-    logging.info("Backing up roles...")
+    await update_progress(interaction, 2, total_steps, "Backing up roles...")
+    
+    # Step 2: Backup roles
     for role in guild.roles:
         backup_data['roles'][role.id] = await backup_role(role)
     logging.info(f"✓ Backed up {len(backup_data['roles'])} roles")
-
-    # Backup member roles
-    logging.info("Backing up member roles...")
+    await update_progress(interaction, 3, total_steps, "Backing up member roles...")
+    
+    # Step 3: Backup member roles
     member_tasks = []
     for member in guild.members:
-        if not member.bot:  # Skip bots
+        if not member.bot:
             member_tasks.append(backup_member_roles(member))
-    
     backup_data['members'] = await asyncio.gather(*member_tasks)
     logging.info(f"✓ Backed up roles for {len(backup_data['members'])} members")
+    await update_progress(interaction, 4, total_steps, "Backing up all channels/catagories/messages...")
     
-    # Backup categories
-    logging.info("Backing up categories...")
+    # Step 4: Backup categories
     for category in guild.categories:
         backup_data['categories'][category.id] = {
             'name': category.name,
@@ -234,58 +232,51 @@ async def backup_server(interaction, max_messages: Optional[int] = None):
         }
     logging.info(f"✓ Backed up {len(backup_data['categories'])} categories")
     
-    # Backup channels
-    channel_tasks = [backup_channel(channel, max_messages) 
-                    for channel in guild.channels]
-    channel_data = await asyncio.gather(*channel_tasks)
-    
-    # Add a message counter
-    total_messages = 0
+    # Step 5: Backup channels sequentially with per‐channel logging
+    logging.info("Backing up channels...")
     channel_stats = {}
-    for data in channel_data:
+    total_messages = 0
+    channels = list(guild.channels)
+    total_channels = len(channels)
+    for idx, channel in enumerate(channels, start=1):
+        data = await backup_channel(channel, max_messages)
         backup_data['channels'][data['name']] = data
         count = len(data.get('messages', []))
         total_messages += count
         channel_stats[data['name']] = count
+        logging.info(f"Backed up channel {idx}/{total_channels}: {channel.name}")
+    logging.info(f"✓ Backed up channels. Total messages: {total_messages}")
+    await update_progress(interaction, 6, total_steps, "Backing up emojis and stickers...")
     
-    # Backup emojis
+    # Step 6: Backup emojis and stickers
     logging.info("Backing up emojis...")
     emoji_tasks = []
     for emoji in guild.emojis:
-        if not emoji.managed:  # Skip managed emojis (like Nitro emojis)
+        if not emoji.managed:
             emoji_tasks.append(backup_emoji_or_sticker(emoji))
-    
     if emoji_tasks:
         emoji_results = await asyncio.gather(*emoji_tasks)
-        # Filter out None results from failed backups
         backup_data['emojis'] = [e for e in emoji_results if e is not None]
         logging.info(f"✓ Backed up {len(backup_data['emojis'])} emojis")
     else:
         logging.info("No emojis to backup")
-
-    # Backup stickers
     logging.info("Backing up stickers...")
     sticker_tasks = []
     for sticker in guild.stickers:
-        if not sticker.available:  # Skip unavailable stickers
+        if not sticker.available:
             continue
         sticker_tasks.append(backup_emoji_or_sticker(sticker))
-    
     if sticker_tasks:
         sticker_results = await asyncio.gather(*sticker_tasks)
-        # Filter out None results from failed backups
         backup_data['stickers'] = [s for s in sticker_results if s is not None]
         logging.info(f"✓ Backed up {len(backup_data['stickers'])} stickers")
-    else:
-        logging.info("No stickers to backup")
-
-    filename = f'backup_{interaction.guild.id}_{timestamp}.json'
+    
+    await update_progress(interaction, 7, total_steps, "Finalizing backup...")
+    filename = f'backup_{guild.id}_{timestamp}.json'
     async with aiofiles.open(filename, 'w') as f:
         await f.write(json.dumps(backup_data))
-    
     logging.info(f"Backup completed! Saved to {filename}")
-    
-    # Return necessary data for the backup summary
+    await update_progress(interaction, 8, total_steps, "Backup completed!")
     return backup_data, channel_stats, timestamp
 
 async def restore_channel(channel, data):
@@ -486,8 +477,16 @@ async def restore_server(interaction, backup):
     for emoji_data in backup.get('emojis', []):
         try:
             image = bytes.fromhex(emoji_data['image'])
+            # Sanitize emoji name to allow only letters, numbers, and underscores
+            raw_name = emoji_data['name']
+            cleaned_name = re.sub(r'[^a-zA-Z0-9_]', '', raw_name)
+            if len(cleaned_name) > (32 - len("_restored")):
+                cleaned_name = cleaned_name[:(32 - len("_restored"))]
+            if len(cleaned_name) < 2:
+                cleaned_name = "emoji"
+            new_name = f"{cleaned_name}_restored"  # changed suffix from '-' to '_'
             await interaction.guild.create_custom_emoji(
-                name=f"{emoji_data['name']}-restored",
+                name=new_name,
                 image=image
             )
         except Exception as e:
@@ -499,7 +498,8 @@ async def restore_server(interaction, backup):
             await interaction.guild.create_sticker(
                 name=f"{sticker_data['name']}-restored",
                 file=discord.File(io.BytesIO(image), filename='sticker.png'),
-                emoji='👍'  # Default emoji
+                emoji='👍',  # Default emoji
+                description="Sticker restored from backup"
             )
         except Exception as e:
             logging.error(f"Error restoring sticker {sticker_data['name']}: {e}")
@@ -514,49 +514,24 @@ def get_progress_bar(current: int, total: int, bar_length: int = 20) -> str:
     bar = '#' * filled + '-' * (bar_length - filled)
     return f"[{bar}] {current}/{total}"
 
-# NEW: Update ephemeral message and log progress
-async def update_progress(interaction: discord.Interaction, msg_obj, current: int, total: int, task: str):
+# UPDATED: Update ephemeral message and log progress using the original response
+async def update_progress(interaction: discord.Interaction, current: int, total: int, task: str):
     progress_text = f"Progress: {get_progress_bar(current, total)} - {task}"
-    await interaction.followup.edit_message(msg_obj.id, content=progress_text)
+    await interaction.edit_original_response(content=progress_text)
     logging.info(progress_text)
 
+# UPDATED: Modify backup command to remove intermediate update calls externally
 @client.tree.command(name="backup", description="Create a backup of the entire server")
 @app_commands.describe(
     max_messages="Maximum number of messages to backup per channel (default: all messages)"
 )
 @app_commands.checks.has_permissions(administrator=True)
 async def backup(interaction: discord.Interaction, max_messages: Optional[int] = None):
-    total_steps = 8  # Adjust as needed per major backup step
-    # Send an initial ephemeral progress message
+    total_steps = 8
     await interaction.response.send_message(
         f"Progress: {get_progress_bar(0, total_steps)} - Starting backup...", ephemeral=True
     )
-    # FIX: Retrieve the actual message object for later edits
-    progress_msg = await interaction.original_response()
-    
-    # Step 1: Starting backup
-    await update_progress(interaction, progress_msg, 1, total_steps, "Backing up bans...")
-    backup_data, channel_stats, timestamp = await backup_server(interaction, max_messages)
-    
-    # Step 2: Bans already backed up (logged inside backup_server)
-    await update_progress(interaction, progress_msg, 2, total_steps, "Backing up roles...")
-    
-    # Step 3: Roles
-    await update_progress(interaction, progress_msg, 3, total_steps, "Backing up member roles...")
-    
-    # Step 4: Member roles
-    await update_progress(interaction, progress_msg, 4, total_steps, "Backing up categories...")
-    
-    # Step 5: Categories
-    await update_progress(interaction, progress_msg, 5, total_steps, "Backing up channels...")
-    
-    # Step 6: Channels (this may take a while)
-    await update_progress(interaction, progress_msg, 6, total_steps, "Backing up emojis and stickers...")
-    
-    # Step 7: Emojis and stickers
-    await update_progress(interaction, progress_msg, 7, total_steps, "Finalizing backup...")
-    
-    # Finish: Build and send backup summary as before
+    backup_data, channel_stats, timestamp = await backup_server(interaction, max_messages, total_steps)
     top_channels = sorted(channel_stats.items(), key=lambda x: x[1], reverse=True)[:5]
     stats_message = (
         f"**Backup Completed!**\n"
@@ -568,12 +543,10 @@ async def backup(interaction: discord.Interaction, max_messages: Optional[int] =
         f"• Stickers: {len(backup_data['stickers'])}\n"
         f"• Bans: {len(backup_data['bans'])}\n"
         f"• Backup ID: `{timestamp}`\n\n"
-        f"**Top 5 Channels:**\n" + " ".join(
+        f"**Top 5 Channels:**\n" + "".join(
             [f"• #{channel}: {count} msgs\n" for channel, count in top_channels]
         )
     )
-    
-    await update_progress(interaction, progress_msg, total_steps, total_steps, "Backup completed!")
     await interaction.followup.send(stats_message, ephemeral=True)
 
 @client.tree.command(name="restore", description="Restore a backup (creates new channels)")
@@ -588,10 +561,9 @@ async def restore(interaction: discord.Interaction, backup_id: str, force: bool 
     await interaction.response.send_message(
         f"Progress: {get_progress_bar(0, total_steps)} - Starting restore...", ephemeral=True
     )
-    progress_msg = await interaction.original_response()
     
     # Step 1: Load backup file
-    await update_progress(interaction, progress_msg, 1, total_steps, "Loading backup file...")
+    await update_progress(interaction, 1, total_steps, "Loading backup file...")
     backup_files = get_backup_files()
     filename = next((f for f in backup_files if backup_id in f), None)
     
@@ -612,12 +584,12 @@ async def restore(interaction: discord.Interaction, backup_id: str, force: bool 
         backup = json.load(f)
     
     # Step 2: Restore server structure (roles, categories, channels, member roles)
-    await update_progress(interaction, progress_msg, 2, total_steps, "Restoring server structure...")
+    await update_progress(interaction, 2, total_steps, "Restoring server structure...")
     roles = {}  # roles will be handled inside restore_server
     channels = await restore_server(interaction, backup)
     
     # Step 3: Restore channel messages sequentially
-    await update_progress(interaction, progress_msg, 3, total_steps, "Restoring channel messages...")
+    await update_progress(interaction, 3, total_steps, "Restoring channel messages...")
     total_restored = 0
     total_channels = len(channels)
     for channel, data in channels:
@@ -625,11 +597,11 @@ async def restore(interaction: discord.Interaction, backup_id: str, force: bool 
             await restore_channel(channel, data)
         total_restored += 1
         # Optionally update progress per channel (using current step progress info)
-        await update_progress(interaction, progress_msg, 3, total_steps,
+        await update_progress(interaction, 3, total_steps,
                               f"Restoring messages: {total_restored}/{total_channels} channels")
     
     # Step 4: Finalize restoration and send summary
-    await update_progress(interaction, progress_msg, total_steps, total_steps, "Finalizing restore...")
+    await update_progress(interaction, total_steps, total_steps, "Finalizing restore...")
     await interaction.followup.send(
         f"Restore completed!\n"
         f"• Categories restored: {len(backup.get('categories', {}))}\n"
@@ -637,23 +609,27 @@ async def restore(interaction: discord.Interaction, backup_id: str, force: bool 
         ephemeral=True
     )
 
-@client.tree.command(name="undo", description="Remove all restored channels and roles")
+@client.tree.command(name="undo", description="Remove all restored channels, roles, emojis, stickers")
 @app_commands.checks.has_permissions(administrator=True)
 async def undo(interaction: discord.Interaction):
-    # Gather restored channels and roles
+    # Find restored channels and roles as before
     restored_channels = [c for c in interaction.guild.channels if '-restored' in c.name]
     restored_roles = [r for r in interaction.guild.roles if '-restored' in r.name]
-    total_ops = len(restored_channels) + len(restored_roles)
+    # Re-fetch emojis and stickers to get the latest data
+    restored_emojis = [e for e in await interaction.guild.fetch_emojis() if '_restored' in e.name]
+    restored_stickers = [s for s in await interaction.guild.fetch_stickers() if '-restored' in s.name]
+    
+    # Removed bans lookup
+    total_ops = (len(restored_channels) + len(restored_roles) + 
+                 len(restored_emojis) + len(restored_stickers))
     if total_ops == 0:
-        await interaction.response.send_message("No restored channels or roles found.", ephemeral=True)
+        await interaction.response.send_message("No restored channels, roles, emojis, or stickers found.", ephemeral=True)
         return
-    # Send initial progress message
     await interaction.response.send_message(
         f"Progress: {get_progress_bar(0, total_ops)} - Starting cleanup...", ephemeral=True
     )
-    progress_msg = await interaction.original_response()
     ops_done = 0
-    
+
     # Delete channels
     for channel in restored_channels:
         try:
@@ -661,8 +637,8 @@ async def undo(interaction: discord.Interaction):
         except Exception as e:
             logging.error(f"Error deleting channel {channel.name}: {e}")
         ops_done += 1
-        await update_progress(interaction, progress_msg, ops_done, total_ops, f"Deleted channel: {channel.name}")
-    
+        await update_progress(interaction, ops_done, total_ops, f"Deleted channel: {channel.name}")
+
     # Delete roles
     for role in restored_roles:
         try:
@@ -670,12 +646,32 @@ async def undo(interaction: discord.Interaction):
         except Exception as e:
             logging.error(f"Error deleting role {role.name}: {e}")
         ops_done += 1
-        await update_progress(interaction, progress_msg, ops_done, total_ops, f"Deleted role: {role.name}")
-    
+        await update_progress(interaction, ops_done, total_ops, f"Deleted role: {role.name}")
+
+    # Delete emojis
+    for emoji in restored_emojis:
+        try:
+            await emoji.delete()
+        except Exception as e:
+            logging.error(f"Error deleting emoji {emoji.name}: {e}")
+        ops_done += 1
+        await update_progress(interaction, ops_done, total_ops, f"Deleted emoji: {emoji.name}")
+
+    # Delete stickers
+    for sticker in restored_stickers:
+        try:
+            await sticker.delete()
+        except Exception as e:
+            logging.error(f"Error deleting sticker {sticker.name}: {e}")
+        ops_done += 1
+        await update_progress(interaction, ops_done, total_ops, f"Deleted sticker: {sticker.name}")
+
     await interaction.followup.send(
         f"Cleanup completed!\n"
         f"• Channels removed: {len(restored_channels)}\n"
-        f"• Roles removed: {len(restored_roles)}",
+        f"• Roles removed: {len(restored_roles)}\n"
+        f"• Emojis removed: {len(restored_emojis)}\n"
+        f"• Stickers removed: {len(restored_stickers)}",
         ephemeral=True
     )
 
